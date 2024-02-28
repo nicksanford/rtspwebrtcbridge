@@ -6,10 +6,17 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"strconv"
+	"os"
+	"time"
 
+	"github.com/bluenviron/gortsplib/v4"
+	"github.com/bluenviron/gortsplib/v4/pkg/base"
+	"github.com/bluenviron/gortsplib/v4/pkg/format"
+	"github.com/bluenviron/gortsplib/v4/pkg/format/rtph264"
 	"github.com/gorilla/websocket"
-	"github.com/pion/rtwatch/gst"
+	"github.com/nicksanford/rtspwebrtcbridge/formatprocessor"
+	"github.com/nicksanford/rtspwebrtcbridge/unit"
+	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v3"
 )
 
@@ -43,6 +50,7 @@ const homeHTML = `<!DOCTYPE html>
 			}
 
 			pc.ontrack = function (event) {
+				console.log("on track", event);
 			  if (event.track.kind === 'audio') {
 				return
 			  }
@@ -53,15 +61,18 @@ const homeHTML = `<!DOCTYPE html>
 			}
 
 			conn.onopen = () => {
+	console.log("open");
 				pc.createOffer({offerToReceiveVideo: true, offerToReceiveAudio: true}).then(offer => {
 					pc.setLocalDescription(offer)
 					conn.send(JSON.stringify({event: 'offer', data: JSON.stringify(offer)}))
 				})
 			}
 			conn.onclose = evt => {
+	console.log("close");
 				console.log('Connection closed')
 			}
 			conn.onmessage = evt => {
+				console.log("message"), evt;
 				let msg = JSON.parse(evt.data)
 				if (!msg) {
 					return console.log('failed to parse msg')
@@ -74,6 +85,7 @@ const homeHTML = `<!DOCTYPE html>
 						return console.log('failed to parse answer')
 					}
 					pc.setRemoteDescription(answer)
+					return console.log('processed answer')
 				}
 			}
 			window.conn = conn
@@ -87,12 +99,8 @@ var (
 		ReadBufferSize:  1024,
 		WriteBufferSize: 1024,
 	}
-
 	peerConnectionConfig = webrtc.Configuration{}
-
-	audioTrack = &webrtc.TrackLocalStaticSample{}
-	videoTrack = &webrtc.TrackLocalStaticSample{}
-	pipeline   = &gst.Pipeline{}
+	videoTrackRTP        = &webrtc.TrackLocalStaticRTP{}
 )
 
 type websocketMessage struct {
@@ -101,49 +109,143 @@ type websocketMessage struct {
 }
 
 func main() {
-	containerPath := ""
+	if len(os.Args) != 2 {
+		log.Fatalf("usage %s <rtsp server url>", os.Args[0])
+	}
 	httpListenAddress := ""
-	flag.StringVar(&containerPath, "container-path", "", "path to the media file you want to playback")
 	flag.StringVar(&httpListenAddress, "http-listen-address", ":8080", "address for HTTP server to listen on")
 	flag.Parse()
 
-	if containerPath == "" {
-		panic("-container-path must be specified")
-	}
-
 	var err error
-	videoTrack, err = webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: "video/h264"}, "synced-video", "synced-video")
+	videoTrackRTP, err = webrtc.NewTrackLocalStaticRTP(webrtc.RTPCodecCapability{MimeType: "video/h264"}, "synced-video", "synced-video")
 	if err != nil {
 		log.Fatal(err)
 	}
+	log.Println(videoTrackRTP.Codec())
 
-	audioTrack, err = webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: "audio/opus"}, "synced-video", "synced-video")
+	c := gortsplib.Client{}
+
+	// parse URL
+	u, err := base.ParseURL(os.Args[1])
 	if err != nil {
-		log.Fatal(err)
+		panic(err)
 	}
 
-	pipeline = gst.CreatePipeline(containerPath, audioTrack, videoTrack)
-	pipeline.Start()
+	// connect to the server
+	err = c.Start(u.Scheme, u.Host)
+	if err != nil {
+		panic(err)
+	}
+
+	defer c.Close()
+
+	go stream(&c, u)
 
 	http.HandleFunc("/", serveHome)
 	http.HandleFunc("/ws", serveWs)
 
-	fmt.Printf("Video file '%s' is now available on '%s', have fun! \n", containerPath, httpListenAddress)
+	fmt.Printf("streaming on '%s', have fun! \n", httpListenAddress)
 	log.Fatal(http.ListenAndServe(httpListenAddress, nil))
+}
+
+func stream(c *gortsplib.Client, u *base.URL) {
+	// find available medias
+	desc, _, err := c.Describe(u)
+	if err != nil {
+		panic(err)
+	}
+
+	// find the H264 media and format
+	var forma *format.H264
+	medi := desc.FindFormat(&forma)
+	if medi == nil {
+		panic("media not found")
+	}
+	log.Printf("%#v", forma)
+
+	// setup a single media
+	_, err = c.Setup(desc.BaseURL, medi, 0, 0)
+	if err != nil {
+		panic(err)
+	}
+
+	fp, err := formatprocessor.New(1472, forma, true)
+	if err != nil {
+		log.Fatal(err)
+	}
+	firstReceived := false
+	var lastPTS time.Duration
+	webrtcPayloadMaxSize := 1188 // 1200 - 12 (RTP header)
+	encoder := &rtph264.Encoder{
+		PayloadType:    96,
+		PayloadMaxSize: webrtcPayloadMaxSize,
+	}
+
+	if err := encoder.Init(); err != nil {
+		log.Fatal(err)
+	}
+
+	c.OnPacketRTP(medi, forma, func(pkt *rtp.Packet) {
+		pts, ok := c.PacketPTS(medi, pkt)
+		if !ok {
+			log.Printf("waiting for timestamp")
+			return
+		}
+		ntp := time.Now()
+		u, err := fp.ProcessRTPPacket(pkt, ntp, pts, false)
+		if err != nil {
+			log.Println(err.Error())
+			return
+		}
+
+		// NOTE: In mediamtx there is a ring buffer between the goroutine which receives RTP packets from RSTP & the WebRTC publisher
+		// at this point
+		// This might be a place to improve performance by adding a similar ring buffer
+
+		tunit, ok := u.(*unit.H264)
+		if !ok {
+			log.Println("u.(*unit.H264) type conversion error")
+			return
+		}
+
+		if tunit.AU == nil {
+			// log.Printf("tunit.AU == nil")
+			return
+		}
+
+		if !firstReceived {
+			firstReceived = true
+		} else if tunit.PTS < lastPTS {
+			log.Fatal("WebRTC doesn't support H264 streams with B-frames")
+		}
+		lastPTS = tunit.PTS
+
+		packets, err := encoder.Encode(tunit.AU)
+		if err != nil {
+			log.Printf("NICK: Encode err: %s", err.Error())
+			return
+		}
+		log.Printf("sending %d packets", len(packets))
+		for _, pkt := range packets {
+			pkt.Timestamp += tunit.RTPPackets[0].Timestamp
+			if err := videoTrackRTP.WriteRTP(pkt); err != nil {
+				log.Printf("WriteRTP err: %s", err.Error())
+			}
+		}
+	})
+
+	// start playing
+	_, err = c.Play(nil)
+	if err != nil {
+		panic(err)
+	}
+
+	// wait until a fatal error
+	panic(c.Wait())
 }
 
 func handleWebsocketMessage(pc *webrtc.PeerConnection, ws *websocket.Conn, message *websocketMessage) error {
 	switch message.Event {
-	case "play":
-		pipeline.Play()
-	case "pause":
-		pipeline.Pause()
-	case "seek":
-		i, err := strconv.ParseInt(message.Data, 0, 64)
-		if err != nil {
-			log.Print(err)
-		}
-		pipeline.SeekToTime(i)
 	case "offer":
 		offer := webrtc.SessionDescription{}
 		if err := json.Unmarshal([]byte(message.Data), &offer); err != nil {
@@ -178,6 +280,8 @@ func handleWebsocketMessage(pc *webrtc.PeerConnection, ws *websocket.Conn, messa
 		}); err != nil {
 			return err
 		}
+	default:
+
 	}
 	return nil
 }
@@ -193,13 +297,12 @@ func serveWs(w http.ResponseWriter, r *http.Request) {
 
 	peerConnection, err := webrtc.NewPeerConnection(peerConnectionConfig)
 	if err != nil {
-		log.Print(err)
+		log.Println(err)
 		return
-	} else if _, err = peerConnection.AddTrack(audioTrack); err != nil {
-		log.Print(err)
-		return
-	} else if _, err = peerConnection.AddTrack(videoTrack); err != nil {
-		log.Print(err)
+	}
+
+	if _, err = peerConnection.AddTrack(videoTrackRTP); err != nil {
+		log.Println(err)
 		return
 	}
 
@@ -215,12 +318,12 @@ func serveWs(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			break
 		} else if err := json.Unmarshal(msg, &message); err != nil {
-			log.Print(err)
+			log.Println(err)
 			return
 		}
 
 		if err := handleWebsocketMessage(peerConnection, ws, message); err != nil {
-			log.Print(err)
+			log.Println(err)
 		}
 	}
 }
