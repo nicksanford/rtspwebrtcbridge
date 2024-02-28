@@ -1,4 +1,4 @@
-// Package unit contains the Unit definition.
+// https://github.com/bluenviron/mediamtx/blob/main/internal/unit/h264.go & related package
 package unit
 
 import (

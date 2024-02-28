@@ -1,3 +1,4 @@
+// heavily copied from https://github.com/bluenviron/mediamtx/blob/main/internal/formatprocessor/h264.go & the rest of that package
 package formatprocessor
 
 import (
