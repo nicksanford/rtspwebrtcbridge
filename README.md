@@ -7,9 +7,9 @@ Modified fork of https://github.com/pion/rtwatch combined with code from https:/
 ## Description
 Hosts a WebRTC server on port 8080.
 
-Conects to an RTSP server hosting what is assumed to be a h264 video stream.
+Connects to an RTSP server hosting what is assumed to be a h264 video stream.
 
-Transorms the RSTP RTP packets be WebRTC compliant & forwards them to all WebRTC peers connected to the the WebRTC server.
+Transforms the RSTP RTP packets be WebRTC compliant & forwards them to all WebRTC peers connected to the the WebRTC server.
 
 ## Usage:
 ```bash
