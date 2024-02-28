@@ -161,7 +161,6 @@ func stream(c *gortsplib.Client, u *base.URL) {
 	if medi == nil {
 		panic("media not found")
 	}
-	log.Printf("%#v", forma)
 
 	// setup a single media
 	_, err = c.Setup(desc.BaseURL, medi, 0, 0)
@@ -188,7 +187,6 @@ func stream(c *gortsplib.Client, u *base.URL) {
 	c.OnPacketRTP(medi, forma, func(pkt *rtp.Packet) {
 		pts, ok := c.PacketPTS(medi, pkt)
 		if !ok {
-			log.Printf("waiting for timestamp")
 			return
 		}
 		ntp := time.Now()
@@ -209,7 +207,6 @@ func stream(c *gortsplib.Client, u *base.URL) {
 		}
 
 		if tunit.AU == nil {
-			// log.Printf("tunit.AU == nil")
 			return
 		}
 
@@ -225,7 +222,6 @@ func stream(c *gortsplib.Client, u *base.URL) {
 			log.Printf("NICK: Encode err: %s", err.Error())
 			return
 		}
-		log.Printf("sending %d packets", len(packets))
 		for _, pkt := range packets {
 			pkt.Timestamp += tunit.RTPPackets[0].Timestamp
 			if err := videoTrackRTP.WriteRTP(pkt); err != nil {
