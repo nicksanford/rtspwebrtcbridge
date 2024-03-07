@@ -9,8 +9,10 @@ import (
 	"os"
 	"time"
 
+	"github.com/aler9/gortsplib/pkg/rtpcodecs/rtph265"
 	"github.com/bluenviron/gortsplib/v4"
 	"github.com/bluenviron/gortsplib/v4/pkg/base"
+	"github.com/bluenviron/gortsplib/v4/pkg/description"
 	"github.com/bluenviron/gortsplib/v4/pkg/format"
 	"github.com/bluenviron/gortsplib/v4/pkg/format/rtph264"
 	"github.com/gorilla/websocket"
@@ -39,16 +41,7 @@ const homeHTML = `<!DOCTYPE html>
 			let conn = new WebSocket('ws://' + window.location.host + '/ws')
 			let pc = new RTCPeerConnection()
 
-			window.seekClick = () => {
-				conn.send(JSON.stringify({event: 'seek', data: document.getElementById('seekTime').value}))
-			}
-			window.playClick = () => {
-				conn.send(JSON.stringify({event: 'play', data: ''}))
-			}
-			window.pauseClick = () => {
-				conn.send(JSON.stringify({event: 'pause', data: ''}))
-			}
-
+			console.log("before on track register")
 			pc.ontrack = function (event) {
 				console.log("on track", event);
 			  if (event.track.kind === 'audio') {
@@ -60,17 +53,23 @@ const homeHTML = `<!DOCTYPE html>
 			  el.controls = true
 			}
 
+	// needed for safari to work
+			const x = pc.addTransceiver('video');
+			console.log("before on open register")
 			conn.onopen = () => {
-	console.log("open");
+				console.log("open");
 				pc.createOffer({offerToReceiveVideo: true, offerToReceiveAudio: true}).then(offer => {
+					console.log("got offer", offer.sdp);
 					pc.setLocalDescription(offer)
 					conn.send(JSON.stringify({event: 'offer', data: JSON.stringify(offer)}))
 				})
 			}
+			console.log("before on close register")
 			conn.onclose = evt => {
-	console.log("close");
+				console.log("close");
 				console.log('Connection closed')
 			}
+			console.log("before on message register")
 			conn.onmessage = evt => {
 				console.log("message"), evt;
 				let msg = JSON.parse(evt.data)
@@ -94,6 +93,8 @@ const homeHTML = `<!DOCTYPE html>
 </html>
 `
 
+var mimeLookup = map[string]string{"4": webrtc.MimeTypeH264, "5": webrtc.MimeTypeH265}
+
 var (
 	upgrader = websocket.Upgrader{
 		ReadBufferSize:  1024,
@@ -109,15 +110,21 @@ type websocketMessage struct {
 }
 
 func main() {
-	if len(os.Args) != 2 {
-		log.Fatalf("usage %s <rtsp server url>", os.Args[0])
+	if len(os.Args) != 3 {
+		log.Fatalf("usage %s <rtsp server url> <4|5>", os.Args[0])
 	}
+
+	if os.Args[2] != "4" && os.Args[2] != "5" {
+		log.Fatalf("usage %s <rtsp server url> <4|5>", os.Args[0])
+	}
+
 	httpListenAddress := ""
 	flag.StringVar(&httpListenAddress, "http-listen-address", ":8080", "address for HTTP server to listen on")
 	flag.Parse()
 
+	mimeType := mimeLookup[os.Args[2]]
 	var err error
-	videoTrackRTP, err = webrtc.NewTrackLocalStaticRTP(webrtc.RTPCodecCapability{MimeType: "video/h264"}, "synced-video", "synced-video")
+	videoTrackRTP, err = webrtc.NewTrackLocalStaticRTP(webrtc.RTPCodecCapability{MimeType: mimeType}, "synced-video", "synced-video")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -139,7 +146,7 @@ func main() {
 
 	defer c.Close()
 
-	go stream(&c, u)
+	go stream(&c, u, mimeType)
 
 	http.HandleFunc("/", serveHome)
 	http.HandleFunc("/ws", serveWs)
@@ -148,18 +155,31 @@ func main() {
 	log.Fatal(http.ListenAndServe(httpListenAddress, nil))
 }
 
-func stream(c *gortsplib.Client, u *base.URL) {
+func stream(c *gortsplib.Client, u *base.URL, mimeType string) {
 	// find available medias
 	desc, _, err := c.Describe(u)
 	if err != nil {
 		panic(err)
 	}
 
-	// find the H264 media and format
-	var forma *format.H264
-	medi := desc.FindFormat(&forma)
-	if medi == nil {
-		panic("media not found")
+	var forma format.Format
+	var medi *description.Media
+	if mimeType == webrtc.MimeTypeH264 {
+		var f *format.H264
+		medi = desc.FindFormat(&f)
+		if medi == nil {
+			panic("media not found")
+		}
+		forma = f
+	} else if mimeType == webrtc.MimeTypeH265 {
+		var f *format.H265
+		medi = desc.FindFormat(&f)
+		if medi == nil {
+			panic("media not found")
+		}
+		forma = f
+	} else {
+		panic("provide media type")
 	}
 
 	// setup a single media
@@ -172,17 +192,31 @@ func stream(c *gortsplib.Client, u *base.URL) {
 	if err != nil {
 		log.Fatal(err)
 	}
+
 	firstReceived := false
 	var lastPTS time.Duration
 	webrtcPayloadMaxSize := 1188 // 1200 - 12 (RTP header)
-	encoder := &rtph264.Encoder{
+
+	h264Encoder := &rtph264.Encoder{
 		PayloadType:    96,
 		PayloadMaxSize: webrtcPayloadMaxSize,
 	}
 
-	if err := encoder.Init(); err != nil {
+	if err := h264Encoder.Init(); err != nil {
 		log.Fatal(err)
 	}
+
+	h265Encoder := &rtph265.Encoder{
+		PayloadType:    96,
+		PayloadMaxSize: webrtcPayloadMaxSize,
+	}
+
+	h265Encoder.Init()
+	// if mimeType == "video/h264" {
+	// } else if mimeType == "video/h265" {
+	// } else {
+	// 	panic("provide media type")
+	// }
 
 	c.OnPacketRTP(medi, forma, func(pkt *rtp.Packet) {
 		pts, ok := c.PacketPTS(medi, pkt)
@@ -200,34 +234,62 @@ func stream(c *gortsplib.Client, u *base.URL) {
 		// at this point
 		// This might be a place to improve performance by adding a similar ring buffer
 
-		tunit, ok := u.(*unit.H264)
-		if !ok {
-			log.Println("u.(*unit.H264) type conversion error")
-			return
-		}
-
-		if tunit.AU == nil {
-			return
-		}
-
-		if !firstReceived {
-			firstReceived = true
-		} else if tunit.PTS < lastPTS {
-			log.Fatal("WebRTC doesn't support H264 streams with B-frames")
-		}
-		lastPTS = tunit.PTS
-
-		packets, err := encoder.Encode(tunit.AU)
-		if err != nil {
-			log.Printf("NICK: Encode err: %s", err.Error())
-			return
-		}
-		for _, pkt := range packets {
-			pkt.Timestamp += tunit.RTPPackets[0].Timestamp
-			if err := videoTrackRTP.WriteRTP(pkt); err != nil {
-				log.Printf("WriteRTP err: %s", err.Error())
+		switch forma.(type) {
+		case *format.H264:
+			tunit, ok := u.(*unit.H264)
+			if !ok {
+				log.Println("u.(*unit.H264) type conversion error")
+				return
 			}
+
+			if tunit.AU == nil {
+				return
+			}
+
+			if !firstReceived {
+				firstReceived = true
+			} else if tunit.PTS < lastPTS {
+				log.Fatal("WebRTC doesn't support H264 streams with B-frames")
+			}
+			lastPTS = tunit.PTS
+			packets, err := h264Encoder.Encode(tunit.AU)
+			if err != nil {
+				panic(err.Error())
+			}
+			for _, pkt := range packets {
+				pkt.Timestamp += tunit.RTPPackets[0].Timestamp
+				if err := videoTrackRTP.WriteRTP(pkt); err != nil {
+					log.Printf("WriteRTP err: %s", err.Error())
+				}
+			}
+
+		case *format.H265:
+			tunit, ok := u.(*unit.H265)
+			if !ok {
+				log.Println("u.(*unit.H265) type conversion error")
+				return
+			}
+
+			if tunit.AU == nil {
+				return
+			}
+
+			packets, err := h265Encoder.Encode(tunit.AU, pts)
+			if err != nil {
+				panic(err.Error())
+			}
+
+			for _, pkt := range packets {
+				pkt.Timestamp += tunit.RTPPackets[0].Timestamp
+				if err := videoTrackRTP.WriteRTP(pkt); err != nil {
+					log.Printf("WriteRTP err: %s", err.Error())
+				}
+			}
+
+		default:
+			panic("unsupported type")
 		}
+
 	})
 
 	// start playing
@@ -245,29 +307,31 @@ func handleWebsocketMessage(pc *webrtc.PeerConnection, ws *websocket.Conn, messa
 	case "offer":
 		offer := webrtc.SessionDescription{}
 		if err := json.Unmarshal([]byte(message.Data), &offer); err != nil {
-			return err
+			panic(err)
 		}
+		fmt.Println(message.Data)
+		fmt.Println(offer)
 
 		if err := pc.SetRemoteDescription(offer); err != nil {
-			return err
+			panic(err)
 		}
 
 		answer, err := pc.CreateAnswer(nil)
 		if err != nil {
-			return err
+			panic(err)
 		}
 
 		gatherComplete := webrtc.GatheringCompletePromise(pc)
 
 		if err := pc.SetLocalDescription(answer); err != nil {
-			return err
+			panic(err)
 		}
 
 		<-gatherComplete
 
 		answerString, err := json.Marshal(pc.LocalDescription())
 		if err != nil {
-			return err
+			panic(err)
 		}
 
 		if err = ws.WriteJSON(&websocketMessage{
@@ -286,25 +350,22 @@ func serveWs(w http.ResponseWriter, r *http.Request) {
 	ws, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		if _, ok := err.(websocket.HandshakeError); !ok {
-			log.Println(err)
+			panic(err)
 		}
-		return
 	}
 
 	peerConnection, err := webrtc.NewPeerConnection(peerConnectionConfig)
 	if err != nil {
-		log.Println(err)
-		return
+		panic(err)
 	}
 
 	if _, err = peerConnection.AddTrack(videoTrackRTP); err != nil {
-		log.Println(err)
-		return
+		panic(err)
 	}
 
 	defer func() {
 		if err := peerConnection.Close(); err != nil {
-			log.Println(err)
+			panic(err)
 		}
 	}()
 
@@ -314,12 +375,11 @@ func serveWs(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			break
 		} else if err := json.Unmarshal(msg, &message); err != nil {
-			log.Println(err)
-			return
+			panic(err)
 		}
 
 		if err := handleWebsocketMessage(peerConnection, ws, message); err != nil {
-			log.Println(err)
+			panic(err)
 		}
 	}
 }

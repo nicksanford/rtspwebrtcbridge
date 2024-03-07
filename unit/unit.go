@@ -19,8 +19,27 @@ type Unit interface {
 	GetPTS() time.Duration
 }
 
+type Processor interface {
+	// process a Unit.
+	ProcessUnit(Unit) error
+
+	// process a RTP packet and convert it into a unit.
+	ProcessRTPPacket(
+		pkt *rtp.Packet,
+		ntp time.Time,
+		pts time.Duration,
+		hasNonRTSPReaders bool,
+	) (Unit, error)
+}
+
 // H264 is a H264 data unit.
 type H264 struct {
+	Base
+	AU [][]byte
+}
+
+// H265 is a H265 data unit.
+type H265 struct {
 	Base
 	AU [][]byte
 }
